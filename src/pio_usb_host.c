@@ -285,9 +285,32 @@ static void __no_inline_not_in_flash_func(iso_ring_copy_out)(uint8_t *dst, uint3
   iso_ring_count -= len;
 }
 
+// Length of the record at the head of the ring, header included. A lost
+// marker (0xffff) is a record of just its two header bytes.
+static uint32_t __no_inline_not_in_flash_func(iso_ring_head_len)(void) {
+  uint16_t const value = iso_ring[iso_ring_head] |
+                         (iso_ring[(iso_ring_head + 1) % PIO_USB_ISO_RING_SIZE] << 8);
+  return value == 0xffff ? 2 : value + 2u;
+}
+
+// Make room for a new record by dropping the oldest one, so the ring always
+// holds the newest part of the stream when the application falls behind.
+// One lost marker stays at the head to show where the gap is: it is put in
+// front of the oldest surviving record, or kept there if already present.
+static void __no_inline_not_in_flash_func(iso_ring_drop_oldest)(void) {
+  if (iso_ring_head_len() == 2) {
+    iso_ring_copy_out(NULL, 2); // the marker; put back below
+  }
+  iso_ring_copy_out(NULL, iso_ring_head_len());
+  iso_ring_head = (iso_ring_head + PIO_USB_ISO_RING_SIZE - 2) % PIO_USB_ISO_RING_SIZE;
+  iso_ring_count += 2;
+  iso_ring[iso_ring_head] = 0xff;
+  iso_ring[(iso_ring_head + 1) % PIO_USB_ISO_RING_SIZE] = 0xff;
+}
+
 static void __no_inline_not_in_flash_func(iso_ring_receive)(endpoint_t *ep, int len,
                                                            uint8_t pid, uint8_t const *data) {
-  static const uint8_t lost_marker[2] = {0xff, 0xff};
+  uint8_t const lost_marker[2] = {0xff, 0xff};
   if (len < 0) {
     if (pid == USB_PID_DATA0 || pid == USB_PID_DATA1) {
       iso_ring_lost = true; // packet arrived corrupted
@@ -301,18 +324,20 @@ static void __no_inline_not_in_flash_func(iso_ring_receive)(endpoint_t *ep, int 
   } else {
     iso_ring_silent = 0;
   }
-  if (iso_ring_lost && iso_ring_count + 2 <= PIO_USB_ISO_RING_SIZE) {
+  if (iso_ring_lost) {
+    while (iso_ring_count + 2 > PIO_USB_ISO_RING_SIZE) {
+      iso_ring_drop_oldest();
+    }
     iso_ring_copy_in(lost_marker, 2);
     iso_ring_lost = false;
   }
   if (len > 0) {
-    if (iso_ring_lost || iso_ring_count + 2 + len > PIO_USB_ISO_RING_SIZE) {
-      iso_ring_lost = true; // ring full
-    } else {
-      uint8_t const header[2] = {len & 0xff, len >> 8};
-      iso_ring_copy_in(header, 2);
-      iso_ring_copy_in(data, len);
+    while (iso_ring_count + 2 + len > PIO_USB_ISO_RING_SIZE) {
+      iso_ring_drop_oldest();
     }
+    uint8_t const header[2] = {len & 0xff, len >> 8};
+    iso_ring_copy_in(header, 2);
+    iso_ring_copy_in(data, len);
   }
 
   if (!ep->has_transfer || ep->transfer_aborted) {
