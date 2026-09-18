@@ -285,6 +285,18 @@ static void __no_inline_not_in_flash_func(iso_ring_copy_out)(uint8_t *dst, uint3
   iso_ring_count -= len;
 }
 
+// A record longer than what the ring holds means the ring is corrupted.
+// Empty it and report a gap.
+static bool __no_inline_not_in_flash_func(iso_ring_check_len)(uint32_t len) {
+  if (len <= iso_ring_count) {
+    return true;
+  }
+  iso_ring_head = 0;
+  iso_ring_count = 0;
+  iso_ring_lost = true;
+  return false;
+}
+
 // Length of the record at the head of the ring, header included. A lost
 // marker (0xffff) is a record of just its two header bytes.
 static uint32_t __no_inline_not_in_flash_func(iso_ring_head_len)(void) {
@@ -298,8 +310,16 @@ static uint32_t __no_inline_not_in_flash_func(iso_ring_head_len)(void) {
 // One lost marker stays at the head to show where the gap is: it is put in
 // front of the oldest surviving record, or kept there if already present.
 static void __no_inline_not_in_flash_func(iso_ring_drop_oldest)(void) {
+  if (iso_ring_count < 2 || !iso_ring_check_len(iso_ring_head_len())) {
+    iso_ring_count = 0;
+    iso_ring_lost = true;
+    return;
+  }
   if (iso_ring_head_len() == 2) {
     iso_ring_copy_out(NULL, 2); // the marker; put back below
+    if (iso_ring_count < 2 || !iso_ring_check_len(iso_ring_head_len())) {
+      return;
+    }
   }
   iso_ring_copy_out(NULL, iso_ring_head_len());
   iso_ring_head = (iso_ring_head + PIO_USB_ISO_RING_SIZE - 2) % PIO_USB_ISO_RING_SIZE;
@@ -340,14 +360,15 @@ static void __no_inline_not_in_flash_func(iso_ring_receive)(endpoint_t *ep, int 
     iso_ring_copy_in(data, len);
   }
 
-  if (!ep->has_transfer || ep->transfer_aborted) {
+  if (!ep->transfer_started || !ep->has_transfer || ep->transfer_aborted) {
     return;
   }
   // Hand over as many whole records as fit in the transfer buffer.
   while (iso_ring_count >= 2) {
-    uint16_t const value = iso_ring[iso_ring_head] |
-                           (iso_ring[(iso_ring_head + 1) % PIO_USB_ISO_RING_SIZE] << 8);
-    uint16_t const rec_len = value == 0xffff ? 2 : value + 2;
+    uint32_t const rec_len = iso_ring_head_len();
+    if (!iso_ring_check_len(rec_len)) {
+      break;
+    }
     if (rec_len > ep->total_len) {
       iso_ring_copy_out(NULL, rec_len); // can never fit; drop it
       iso_ring_lost = true;
@@ -417,12 +438,14 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
           }
           continue;
         }
-        bool const active = (ep->has_transfer && !ep->transfer_aborted) || ep == iso_ring_ep;
+        bool const live = ep->has_transfer && !ep->transfer_aborted;
+        bool const active = live || ep == iso_ring_ep;
 #else
-        bool const active = ep->has_transfer && !ep->transfer_aborted;
+        bool const live = ep->has_transfer && !ep->transfer_aborted;
+        bool const active = live;
 #endif
         if (active) {
-          ep->transfer_started = true;
+          ep->transfer_started = live;
 
           if (ep->need_pre) {
             pp->need_pre = true;
@@ -670,7 +693,7 @@ bool pio_usb_host_endpoint_abort_transfer(uint8_t root_idx, uint8_t device_addre
   // Race potential: SOF timer can be called before transfer_aborted is actually set
   // and started the transfer. Wait 1 usb frame for transaction to complete.
   // On the next SOF timer, transfer_aborted will be checked and skipped
-  while (ep->has_transfer && ep->transfer_started) {
+  for (int wait_ms = 0; wait_ms < 8 && ep->has_transfer && ep->transfer_started; wait_ms++) {
     busy_wait_ms(1);
   }
 
