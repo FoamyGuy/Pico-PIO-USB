@@ -742,8 +742,10 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
   }
 
 #if PIO_USB_ISO_RING_SIZE
-  if (is_iso && ep == iso_ring_ep) {
-    iso_ring_receive(ep, receive_len, receive_pid, &pp->usb_rx_buffer[2]);
+  if (is_iso) {
+    if (ep == iso_ring_ep) {
+      iso_ring_receive(ep, receive_len, receive_pid, &pp->usb_rx_buffer[2]);
+    }
   } else
 #endif
   if (is_iso) {
