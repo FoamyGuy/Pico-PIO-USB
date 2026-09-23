@@ -4,6 +4,10 @@
 #include "pio_usb_configuration.h"
 #include "usb_definitions.h"
 
+#if PIO_USB_HOST_BULK_STREAM
+#include "pio_usb_bulk_stream.h"
+#endif
+
 #ifdef __cplusplus
  extern "C" {
 #endif

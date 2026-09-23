@@ -59,6 +59,20 @@ typedef struct {
 #define PIO_USB_HOST_ISOCHRONOUS (PIO_USB_ISO_RING_SIZE > 0)
 #endif
 
+// Host support for continuous bulk IN streaming into a caller-owned ring
+// buffer, polled every frame independently of the application. See
+// pio_usb_bulk_stream.h.
+#ifndef PIO_USB_HOST_BULK_STREAM
+#define PIO_USB_HOST_BULK_STREAM 0
+#endif
+
+// Experimental: also drain ordinary queued bulk IN transfers with several
+// packets per frame instead of one. Changes bus timing for every full-speed
+// bulk device, so it is off until it has been tested more widely.
+#ifndef PIO_USB_HOST_BULK_IN_BURST
+#define PIO_USB_HOST_BULK_IN_BURST 0
+#endif
+
 // RX packet buffer: SYNC + PID + data + CRC16. Full speed isochronous
 // packets carry up to 1023 bytes of data.
 #ifndef PIO_USB_RX_BUFFER_SIZE
