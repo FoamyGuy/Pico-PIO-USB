@@ -247,7 +247,7 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
         }
       } else if (handshake == 0) {
         // Isochronous: no handshake is sent
-        if (idx >= 4 && crc_match) {
+        if (idx >= 4 && idx <= rx_buf_len && crc_match) {
           return idx - 4;
         }
       } else if (handshake == USB_PID_NAK) {
