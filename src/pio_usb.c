@@ -191,7 +191,10 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake_limit
   uint16_t crc_receive = 0xffff;
   bool crc_match = false;
   const uint16_t rx_buf_len = sizeof(pp->usb_rx_buffer) / sizeof(pp->usb_rx_buffer[0]);
-  int16_t idx = 0;
+  // idx keeps counting past rx_buf_len (only the store is bounds checked, so
+  // the CRC keeps rolling). Unsigned so that if it ever wraps it indexes back
+  // into the buffer instead of going negative and writing below it.
+  uint16_t idx = 0;
   if (max_payload > rx_buf_len - 4) {
     return -1;
   }
@@ -221,6 +224,12 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake_limit
   // Timeout in seven microseconds. That is enough time to receive one byte at low speed.
   // This is to detect packets without an EOP because the device was unplugged.
   uint32_t start = get_time_us_32();
+  // Absolute deadline for the whole reception. The 7 us timeout below resets
+  // on every received byte, so a continuously toggling line (babble, or a
+  // disrupted timer per issue #192) can otherwise keep this loop running
+  // forever and overflow idx. The longest legal full-speed packet is ~685 us;
+  // 1200 us leaves margin.
+  uint32_t rx_start = start;
   while (1) {
     if (pio_sm_get_rx_fifo_level(pio_usb_rx, sm_rx)) {
       uint8_t data = pio_sm_get(pio_usb_rx, sm_rx) >> 24;
@@ -249,13 +258,61 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake_limit
 
       if (handshake == USB_PID_ACK) {
         // Only ACK if crc matches
-        if (idx >= 4 && crc_match) {
+        // Never ACK a packet longer than the buffer: bytes were dropped, so
+        // the stored data is truncated even if the rolling CRC matched.
+        if (idx >= 4 && idx <= rx_buf_len && crc_match) {
           pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
           return idx - 4;
         }
+        // Deterministic SYNC realignment. The RX PIO can lock onto a packet a
+        // few bits early, so every byte is shifted and the aligned CRC fails on
+        // data that is actually valid (see sekigon-gonnoc/Pico-PIO-USB#97, open
+        // since 2023: 0x01 0xa5 captured for 0x80 0xd2). Because a correct
+        // packet always begins with SYNC (0x80), the amount of shift is not a
+        // guess: drop k leading bits until SYNC reappears, then confirm with the
+        // PID check nibble and a recomputed CRC. This keys on the SYNC marker
+        // (the standard USB SIE alignment technique, USB-IF SIE white paper) and
+        // recovers any small offset, unlike a blind single-bit retry.
+        if (idx >= 4 && idx <= 18) {
+          for (uint8_t k = 1; k <= 7; k++) {
+            uint8_t fixed[19];
+            for (int16_t i = 0; i < idx; i++) {
+              uint8_t hi = (i + 1 < idx) ? (uint8_t)(usb_rx_buffer[i + 1] << (8 - k)) : 0;
+              fixed[i] = (uint8_t)((usb_rx_buffer[i] >> k) | hi);
+            }
+            if (fixed[0] != USB_SYNC) {
+              continue;
+            }
+            uint8_t rpid = fixed[1];
+            if ((uint8_t)((rpid >> 4) ^ (rpid & 0x0f)) != 0x0f) {
+              continue;
+            }
+            // Try the realigned packet at its natural length and one byte
+            // shorter (the shift can drop the final partial byte).
+            for (int16_t n = idx; n >= idx - 1; n--) {
+              if (n < 4) {
+                continue;
+              }
+              uint16_t c = 0xffff;
+              for (int16_t i = 2; i < n - 2; i++) {
+                c = update_usb_crc16(c, fixed[i]);
+              }
+              c ^= 0xffff;
+              uint16_t rx_crc =
+                  (uint16_t)fixed[n - 2] | ((uint16_t)fixed[n - 1] << 8);
+              if (c == rx_crc) {
+                pio_usb_bus_usb_transfer(pp, ack_encoded, 5);
+                for (int16_t i = 0; i < n; i++) {
+                  usb_rx_buffer[i] = fixed[i];
+                }
+                return n - 4;
+              }
+            }
+          }
+        }
       } else if (handshake == 0) {
         // Isochronous: no handshake is sent
-        if (idx >= 4 && crc_match) {
+        if (idx >= 4 && idx <= rx_buf_len && crc_match) {
           return idx - 4;
         }
       } else if (handshake == USB_PID_NAK) {
@@ -264,8 +321,9 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake_limit
         pio_usb_bus_usb_transfer(pp, stall_encoded, 5);
       }
       break;
-    } else if (get_time_us_32() - start > 7) {
-      return -1; // device is probably unplugged
+    } else if (get_time_us_32() - start > 7 ||
+               get_time_us_32() - rx_start > 1200) {
+      return -1; // device is probably unplugged, or the line is babbling
     }
   }
 
