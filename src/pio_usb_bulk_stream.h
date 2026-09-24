@@ -1,6 +1,6 @@
 /**
- * Copyright (c) 2026 sekigon-gonnoc
- *                    pt (Adafruit Industries)
+ * Copyright (c) 2026 pt (Adafruit Industries)
+ *
  *
  * Host bulk IN streaming (PIO_USB_HOST_BULK_STREAM).
  *
