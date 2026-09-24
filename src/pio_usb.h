@@ -23,6 +23,15 @@ uint32_t pio_usb_host_get_frame_number(void);
 // Call this every 1ms when skip_alarm_pool is true.
 void pio_usb_host_frame(void);
 
+#if PIO_USB_HOST_ISOCHRONOUS
+// Supply storage for the isochronous IN ring. size must be a power of two,
+// >= 2048. Call before any isochronous transfer is queued (buffer == NULL
+// with size 0 disables the ring again). Returns false on a bad size or if
+// the ring is currently attached to an endpoint. Without a ring, isochronous
+// IN transfers still work in the per-transfer (one packet per frame) mode.
+bool pio_usb_host_set_iso_ring(uint8_t *buffer, uint32_t size);
+#endif
+
 // Device functions
 usb_device_t *pio_usb_device_init(const pio_usb_configuration_t *c,
                                   const usb_descriptor_buffers_t *buffers);

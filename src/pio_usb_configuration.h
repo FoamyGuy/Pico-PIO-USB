@@ -51,12 +51,10 @@ typedef struct {
 
 #define PIO_USB_EP_SIZE 64
 
-// Host support for isochronous IN endpoints.
-#ifndef PIO_USB_ISO_RING_SIZE
-#define PIO_USB_ISO_RING_SIZE 0
-#endif
+// Host support for isochronous IN endpoints. Ring storage is supplied at
+// runtime via pio_usb_host_set_iso_ring().
 #ifndef PIO_USB_HOST_ISOCHRONOUS
-#define PIO_USB_HOST_ISOCHRONOUS (PIO_USB_ISO_RING_SIZE > 0)
+#define PIO_USB_HOST_ISOCHRONOUS 0
 #endif
 
 // Host support for continuous bulk IN streaming into a caller-owned ring

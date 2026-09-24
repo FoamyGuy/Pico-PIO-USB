@@ -263,17 +263,21 @@ static int usb_setup_transaction(pio_port_t *pp, endpoint_t *ep);
 static int usb_in_transaction(pio_port_t *pp, endpoint_t *ep);
 static int usb_out_transaction(pio_port_t *pp, endpoint_t *ep);
 
-#if PIO_USB_ISO_RING_SIZE
+#if PIO_USB_HOST_ISOCHRONOUS
 static endpoint_t *iso_ring_ep;
-static uint8_t iso_ring[PIO_USB_ISO_RING_SIZE];
+static uint8_t *iso_ring;      // runtime storage; NULL = ring disabled
+static uint32_t iso_ring_mask; // size - 1; size is a power of two
 static uint32_t iso_ring_head;
 static uint32_t iso_ring_count;
 static bool iso_ring_lost;
 static uint8_t iso_ring_silent; // consecutive frames without a response
 
+// The ring helpers run on the frame core and must stay out of flash, so the
+// ring size is required to be a power of two: a runtime `%` would emit a
+// __aeabi_uidivmod libcall in flash on Cortex-M0+.
 static void __no_inline_not_in_flash_func(iso_ring_copy_in)(uint8_t const *src, uint32_t len) {
-  uint32_t const tail = (iso_ring_head + iso_ring_count) % PIO_USB_ISO_RING_SIZE;
-  uint32_t first = PIO_USB_ISO_RING_SIZE - tail;
+  uint32_t const tail = (iso_ring_head + iso_ring_count) & iso_ring_mask;
+  uint32_t first = (iso_ring_mask + 1) - tail;
   if (first > len) {
     first = len;
   }
@@ -283,7 +287,7 @@ static void __no_inline_not_in_flash_func(iso_ring_copy_in)(uint8_t const *src, 
 }
 
 static void __no_inline_not_in_flash_func(iso_ring_copy_out)(uint8_t *dst, uint32_t len) {
-  uint32_t first = PIO_USB_ISO_RING_SIZE - iso_ring_head;
+  uint32_t first = (iso_ring_mask + 1) - iso_ring_head;
   if (first > len) {
     first = len;
   }
@@ -291,7 +295,7 @@ static void __no_inline_not_in_flash_func(iso_ring_copy_out)(uint8_t *dst, uint3
     memcpy(dst, &iso_ring[iso_ring_head], first);
     memcpy(dst + first, iso_ring, len - first);
   }
-  iso_ring_head = (iso_ring_head + len) % PIO_USB_ISO_RING_SIZE;
+  iso_ring_head = (iso_ring_head + len) & iso_ring_mask;
   iso_ring_count -= len;
 }
 
@@ -311,7 +315,7 @@ static bool __no_inline_not_in_flash_func(iso_ring_check_len)(uint32_t len) {
 // marker (0xffff) is a record of just its two header bytes.
 static uint32_t __no_inline_not_in_flash_func(iso_ring_head_len)(void) {
   uint16_t const value = iso_ring[iso_ring_head] |
-                         (iso_ring[(iso_ring_head + 1) % PIO_USB_ISO_RING_SIZE] << 8);
+                         (iso_ring[(iso_ring_head + 1) & iso_ring_mask] << 8);
   return value == 0xffff ? 2 : value + 2u;
 }
 
@@ -332,10 +336,10 @@ static void __no_inline_not_in_flash_func(iso_ring_drop_oldest)(void) {
     }
   }
   iso_ring_copy_out(NULL, iso_ring_head_len());
-  iso_ring_head = (iso_ring_head + PIO_USB_ISO_RING_SIZE - 2) % PIO_USB_ISO_RING_SIZE;
+  iso_ring_head = (iso_ring_head - 2) & iso_ring_mask; // unsigned wrap is fine
   iso_ring_count += 2;
   iso_ring[iso_ring_head] = 0xff;
-  iso_ring[(iso_ring_head + 1) % PIO_USB_ISO_RING_SIZE] = 0xff;
+  iso_ring[(iso_ring_head + 1) & iso_ring_mask] = 0xff;
 }
 
 static void __no_inline_not_in_flash_func(iso_ring_receive)(endpoint_t *ep, int len,
@@ -355,14 +359,14 @@ static void __no_inline_not_in_flash_func(iso_ring_receive)(endpoint_t *ep, int 
     iso_ring_silent = 0;
   }
   if (iso_ring_lost) {
-    while (iso_ring_count + 2 > PIO_USB_ISO_RING_SIZE) {
+    while (iso_ring_count + 2 > iso_ring_mask + 1) {
       iso_ring_drop_oldest();
     }
     iso_ring_copy_in(lost_marker, 2);
     iso_ring_lost = false;
   }
   if (len > 0) {
-    while (iso_ring_count + 2 + len > PIO_USB_ISO_RING_SIZE) {
+    while (iso_ring_count + 2 + len > iso_ring_mask + 1) {
       iso_ring_drop_oldest();
     }
     uint8_t const header[2] = {len & 0xff, len >> 8};
@@ -393,6 +397,29 @@ static void __no_inline_not_in_flash_func(iso_ring_receive)(endpoint_t *ep, int 
   if (ep->actual_len > 0) {
     pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_COMPLETE_BITS);
   }
+}
+
+bool pio_usb_host_set_iso_ring(uint8_t *buffer, uint32_t size) {
+  if (iso_ring_ep != NULL) {
+    return false; // in use by an endpoint; stop streaming first
+  }
+  if (buffer == NULL) {
+    if (size != 0) {
+      return false;
+    }
+    iso_ring = NULL;
+    iso_ring_mask = 0;
+    return true;
+  }
+  if (size < 2048 || (size & (size - 1))) {
+    return false;
+  }
+  iso_ring = buffer;
+  iso_ring_mask = size - 1;
+  iso_ring_head = 0;
+  iso_ring_count = 0;
+  iso_ring_lost = false;
+  return true;
 }
 #endif
 
@@ -662,8 +689,9 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
           continue;
         }
 
-#if PIO_USB_ISO_RING_SIZE
-        if ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS && (ep->ep_num & EP_IN) &&
+#if PIO_USB_HOST_ISOCHRONOUS
+        if (iso_ring != NULL &&
+            (ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS && (ep->ep_num & EP_IN) &&
             ep != iso_ring_ep) {
           if (ep->has_transfer && !ep->transfer_aborted) {
             pio_usb_ll_transfer_complete(ep, PIO_USB_INTS_ENDPOINT_ERROR_BITS);
@@ -675,7 +703,7 @@ void __not_in_flash_func(pio_usb_host_frame)(void) {
         // but transfer_started stays false: abort must not wait on it.
         bool const live = ep->has_transfer && !ep->transfer_aborted;
         bool active = live;
-#if PIO_USB_ISO_RING_SIZE
+#if PIO_USB_HOST_ISOCHRONOUS
         active = active || ep == iso_ring_ep;
 #endif
 #if PIO_USB_HOST_BULK_STREAM
@@ -853,7 +881,7 @@ void pio_usb_host_close_device(uint8_t root_idx, uint8_t device_address) {
 #endif
       ep->size = 0;
       ep->has_transfer = false;
-#if PIO_USB_ISO_RING_SIZE
+#if PIO_USB_HOST_ISOCHRONOUS
       if (ep == iso_ring_ep) {
         iso_ring_ep = NULL;
       }
@@ -913,7 +941,7 @@ bool pio_usb_host_endpoint_close(uint8_t root_idx, uint8_t device_address,
   }
 #endif
   ep->size = 0; // mark as closed
-#if PIO_USB_ISO_RING_SIZE
+#if PIO_USB_HOST_ISOCHRONOUS
   if (ep == iso_ring_ep) {
     iso_ring_ep = NULL;
   }
@@ -933,13 +961,13 @@ bool pio_usb_host_send_setup(uint8_t root_idx, uint8_t device_address,
   ep->data_id = USB_PID_SETUP;
   ep->is_tx = true;
 
-#if PIO_USB_ISO_RING_SIZE || PIO_USB_HOST_BULK_STREAM
+#if PIO_USB_HOST_ISOCHRONOUS || PIO_USB_HOST_BULK_STREAM
   // SET_CONFIGURATION or SET_INTERFACE: the device's endpoints may change
   // or disappear, so stop streaming from them.
   bool const reconfigures = (setup_packet[0] & 0x60) == 0 &&
                             (setup_packet[1] == 9 || setup_packet[1] == 11);
 #endif
-#if PIO_USB_ISO_RING_SIZE
+#if PIO_USB_HOST_ISOCHRONOUS
   if (reconfigures && iso_ring_ep && iso_ring_ep->dev_addr == device_address) {
     iso_ring_ep = NULL;
   }
@@ -984,8 +1012,9 @@ bool pio_usb_host_endpoint_transfer(uint8_t root_idx, uint8_t device_address,
     ep->data_id = 1; // data and status always start with DATA1
   }
 
-#if PIO_USB_ISO_RING_SIZE
-  if ((ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS && !ep->is_tx && ep != iso_ring_ep) {
+#if PIO_USB_HOST_ISOCHRONOUS
+  if (iso_ring != NULL &&
+      (ep->attr & 0x03) == EP_ATTR_ISOCHRONOUS && !ep->is_tx && ep != iso_ring_ep) {
     // Start receiving this endpoint's packets every frame. Only one
     // isochronous IN endpoint at a time uses the ring.
     iso_ring_ep = NULL;
@@ -1053,7 +1082,7 @@ bool pio_usb_host_bulk_stream_start(uint8_t root_idx, uint8_t device_address,
       !root->connected || root->suspended) {
     return false;
   }
-#if PIO_USB_ISO_RING_SIZE
+#if PIO_USB_HOST_ISOCHRONOUS
   if (ep == iso_ring_ep) {
     return false; // cannot happen for a bulk endpoint; keep the rings apart
   }
@@ -1184,8 +1213,8 @@ static int __no_inline_not_in_flash_func(usb_in_transaction)(pio_port_t *pp,
     }
   }
 
-#if PIO_USB_ISO_RING_SIZE
-  if (is_iso) {
+#if PIO_USB_HOST_ISOCHRONOUS
+  if (is_iso && iso_ring != NULL) {
     if (ep == iso_ring_ep) {
       iso_ring_receive(ep, receive_len, receive_pid, &pp->usb_rx_buffer[2]);
     }
